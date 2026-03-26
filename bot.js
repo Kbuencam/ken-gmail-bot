@@ -1,17 +1,17 @@
 const TelegramBot = require("node-telegram-bot-api");
+const fs = require("fs");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const ALLOWED_USER_ID = parseInt(process.env.ALLOWED_USER_ID || "7470698213");
 
-if (!BOT_TOKEN || !ANTHROPIC_API_KEY) {
-  console.error("Missing BOT_TOKEN or ANTHROPIC_API_KEY");
+if (!BOT_TOKEN || !ANTHROPIC_API_KEY || !OPENAI_API_KEY) {
+  console.error("Missing BOT_TOKEN, ANTHROPIC_API_KEY, or OPENAI_API_KEY");
   process.exit(1);
 }
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-
-// Conversation history per user (in-memory)
 const conversations = {};
 
 const SYSTEM_PROMPT = `You are Ken's personal Gmail assistant for Blend Bubble Tea & Café, his bubble tea and café business in Vancouver/North Vancouver, BC.
@@ -36,14 +36,14 @@ Guidelines:
 - When drafting, always sign off as "Ken"
 - For Gmail organization, use Labels (they function as folders)
 - Always confirm before taking bulk destructive actions (mass delete, etc.)
-- If asked to send an email, draft it first and confirm before sending`;
+- If asked to send an email, draft it first and confirm before sending
+- When replying via voice, keep responses conversational and concise — avoid long bullet lists, speak naturally`;
 
 async function askClaude(userId, userMessage) {
   if (!conversations[userId]) conversations[userId] = [];
 
   conversations[userId].push({ role: "user", content: userMessage });
 
-  // Keep last 20 messages to manage context
   if (conversations[userId].length > 20) {
     conversations[userId] = conversations[userId].slice(-20);
   }
@@ -62,21 +62,13 @@ async function askClaude(userId, userMessage) {
       system: SYSTEM_PROMPT,
       messages: conversations[userId],
       mcp_servers: [
-        {
-          type: "url",
-          url: "https://gmail.mcp.claude.com/mcp",
-          name: "gmail"
-        }
+        { type: "url", url: "https://gmail.mcp.claude.com/mcp", name: "gmail" }
       ]
     })
   });
 
   const data = await response.json();
-
-  if (!response.ok) {
-    console.error("Anthropic API error:", data);
-    throw new Error(data.error?.message || "API error");
-  }
+  if (!response.ok) throw new Error(data.error?.message || "API error");
 
   const replyText = (data.content || [])
     .filter(b => b.type === "text")
@@ -91,73 +83,163 @@ async function askClaude(userId, userMessage) {
   return replyText || "I didn't get a response. Please try again.";
 }
 
+// Transcribe voice using OpenAI Whisper
+async function transcribeVoice(audioBuffer) {
+  const { FormData, Blob } = await import("formdata-node");
+
+  const formData = new FormData();
+  formData.set("file", new Blob([audioBuffer], { type: "audio/ogg" }), "voice.ogg");
+  formData.set("model", "whisper-1");
+  formData.set("language", "en");
+
+  const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${OPENAI_API_KEY}` },
+    body: formData
+  });
+
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error?.message || "Whisper error");
+  return data.text;
+}
+
+// Convert reply text to speech using OpenAI TTS
+async function textToSpeech(text) {
+  // Strip markdown symbols so they aren't spoken aloud
+  const cleanText = text
+    .replace(/\*\*/g, "").replace(/\*/g, "")
+    .replace(/_/g, "").replace(/`/g, "")
+    .replace(/#+\s/g, "").trim();
+
+  const response = await fetch("https://api.openai.com/v1/audio/speech", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "tts-1",
+      input: cleanText,
+      voice: "nova",  // Friendly, clear voice
+      response_format: "ogg_opus"
+    })
+  });
+
+  if (!response.ok) {
+    const err = await response.json();
+    throw new Error(err.error?.message || "TTS error");
+  }
+
+  return Buffer.from(await response.arrayBuffer());
+}
+
 // /start command
 bot.onText(/\/start/, (msg) => {
   if (msg.from.id !== ALLOWED_USER_ID) return;
-  conversations[msg.from.id] = []; // reset
+  conversations[msg.from.id] = [];
   bot.sendMessage(msg.chat.id,
-    "👋 Hey Ken! I'm your Gmail assistant, ready to go.\n\n" +
-    "Here's what you can ask me:\n\n" +
-    "📬 *What are my unread emails?*\n" +
-    "↩️ *Which emails need a reply?*\n" +
-    "📁 *Move Uber Eats emails to a Deliveries folder*\n" +
-    "✍️ *Draft a reply to the wedding inquiry*\n" +
-    "🔍 *Find the email from Mahsa*\n\n" +
-    "Just type naturally — what do you want to tackle?",
+    "👋 Hey Ken! Your Gmail assistant is ready — now with two-way voice!\n\n" +
+    "🎤 *Hold the mic* in Telegram to send a voice message → I'll talk back\n" +
+    "⌨️ *Or type* like normal\n\n" +
+    "Try asking:\n" +
+    "• What are my unread emails?\n" +
+    "• Which emails need a reply?\n" +
+    "• Draft a reply to the wedding inquiry\n" +
+    "• Move Uber Eats emails to a Deliveries folder",
     { parse_mode: "Markdown" }
   );
 });
 
-// /reset command - clear conversation history
+// /reset command
 bot.onText(/\/reset/, (msg) => {
   if (msg.from.id !== ALLOWED_USER_ID) return;
   conversations[msg.from.id] = [];
-  bot.sendMessage(msg.chat.id, "🔄 Conversation reset. Fresh start — what do you need?");
+  bot.sendMessage(msg.chat.id, "🔄 Conversation reset. What do you need?");
 });
 
 // /help command
 bot.onText(/\/help/, (msg) => {
   if (msg.from.id !== ALLOWED_USER_ID) return;
   bot.sendMessage(msg.chat.id,
-    "📋 *Commands:*\n\n" +
-    "/start — restart and reset conversation\n" +
-    "/reset — clear chat history\n" +
-    "/help — show this menu\n\n" +
-    "*Example requests:*\n" +
+    "📋 *Commands:*\n/start — restart\n/reset — clear history\n/help — this menu\n\n" +
+    "🎤 *Voice:* Hold the mic button in Telegram — I'll reply with voice + text\n\n" +
+    "💬 *Try saying:*\n" +
     "• What's unread in my inbox?\n" +
-    "• Summarize emails from this week\n" +
-    "• Create a label called Wedding Inquiries\n" +
-    "• Move all Blend catering emails to a folder\n" +
-    "• Draft a reply to [person]\n" +
-    "• Which emails are urgent?",
+    "• Which emails are urgent?\n" +
+    "• Find the email from Mahsa\n" +
+    "• Draft a reply to [someone]",
     { parse_mode: "Markdown" }
   );
 });
 
-// Handle all regular messages
-bot.on("message", async (msg) => {
-  // Only respond to allowed user
-  if (msg.from.id !== ALLOWED_USER_ID) {
-    bot.sendMessage(msg.chat.id, "Sorry, this is a private assistant.");
-    return;
-  }
+// Handle voice messages
+bot.on("voice", async (msg) => {
+  if (msg.from.id !== ALLOWED_USER_ID) return;
 
-  // Skip commands (handled above)
+  bot.sendChatAction(msg.chat.id, "record_voice");
+
+  try {
+    // Download voice file
+    const fileInfo = await bot.getFile(msg.voice.file_id);
+    const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
+    const audioResponse = await fetch(fileUrl);
+    const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
+
+    // Transcribe with Whisper
+    const transcription = await transcribeVoice(audioBuffer);
+    console.log("Transcribed:", transcription);
+
+    // Echo what was heard
+    await bot.sendMessage(msg.chat.id, `🎤 _"${transcription}"_`, { parse_mode: "Markdown" });
+
+    bot.sendChatAction(msg.chat.id, "typing");
+
+    // Get Claude's reply
+    const reply = await askClaude(msg.from.id, transcription);
+
+    // Convert to speech and send as voice message
+    try {
+      const audioReply = await textToSpeech(reply);
+      const tmpPath = `/tmp/reply_${Date.now()}.ogg`;
+      fs.writeFileSync(tmpPath, audioReply);
+      await bot.sendVoice(msg.chat.id, tmpPath);
+      fs.unlinkSync(tmpPath);
+    } catch (ttsErr) {
+      console.error("TTS failed, sending text only:", ttsErr.message);
+    }
+
+    // Always send text too so Ken can read it
+    if (reply.length > 4000) {
+      const chunks = reply.match(/[\s\S]{1,4000}/g) || [reply];
+      for (const chunk of chunks) {
+        await bot.sendMessage(msg.chat.id, chunk, { parse_mode: "Markdown" });
+      }
+    } else {
+      await bot.sendMessage(msg.chat.id, reply, { parse_mode: "Markdown" });
+    }
+
+  } catch (err) {
+    console.error("Voice error:", err.message);
+    bot.sendMessage(msg.chat.id, "⚠️ Couldn't process voice message. Try again or type instead.");
+  }
+});
+
+// Handle text messages
+bot.on("message", async (msg) => {
+  if (msg.from.id !== ALLOWED_USER_ID) return;
   if (msg.text && msg.text.startsWith("/")) return;
+  if (msg.voice) return;
 
   const text = msg.text;
   if (!text) {
-    bot.sendMessage(msg.chat.id, "I can only handle text messages for now.");
+    bot.sendMessage(msg.chat.id, "I can handle text and voice messages.");
     return;
   }
 
-  // Show typing indicator
   bot.sendChatAction(msg.chat.id, "typing");
 
   try {
     const reply = await askClaude(msg.from.id, text);
-
-    // Telegram has a 4096 char limit — split if needed
     if (reply.length > 4000) {
       const chunks = reply.match(/[\s\S]{1,4000}/g) || [reply];
       for (const chunk of chunks) {
@@ -172,4 +254,4 @@ bot.on("message", async (msg) => {
   }
 });
 
-console.log("✅ Blend Gmail Bot is running...");
+console.log("✅ Blend Gmail Bot is running (voice enabled)...");
